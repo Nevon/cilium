@@ -1,0 +1,378 @@
+#! --enable-service-topology
+# Test that topology-aware hints are honoured for CEC backendServices.
+#
+# The backend service has two endpoints:
+#   2.1.0.1 in zone-a, hinted for zone-a  (local, should be selected)
+#   2.1.0.2 in zone-b, hinted for zone-b  (remote, should NOT be selected)
+
+# Set the node zone before starting so the zone watcher picks it up.
+set-node-labels topology.kubernetes.io/zone=zone-a
+
+hive start
+
+k8s/add service.yaml endpointslice.yaml
+k8s/add be_service.yaml be_endpointslice.yaml
+
+# The BPF datapath filters correctly.
+db/cmp frontends frontends.table
+
+# Redirect the frontend to Envoy, with test/backend as an Envoy upstream.
+k8s/add cec.yaml
+db/cmp ciliumenvoyconfigs cec.table
+
+# Envoy's upstream cluster should contain only the zone-a backend, matching
+# the BPF datapath above.
+* envoy/cmp envoy-filtered.expected
+
+# Removing the topology-mode annotation disables topology-aware routing.
+# Both paths should now select every backend.
+sed 'topology-mode' 'topology-nope' be_service.yaml
+k8s/update be_service.yaml
+db/cmp frontends frontends-all.table
+* envoy/cmp envoy-all.expected
+
+# spec.trafficDistribution is equivalent to the annotation and should
+# behave identically.
+sed '#trafficDistribution' 'trafficDistribution' be_service.yaml
+k8s/update be_service.yaml
+db/cmp frontends frontends.table
+* envoy/cmp envoy-filtered-td.expected
+
+# ---------------------------------------------
+
+-- frontends.table --
+Address            Type        ServiceName     PortName   Backends           Status
+1.0.0.1:80/TCP     ClusterIP   test/frontend   http       1.1.0.1:8080/TCP   Done
+2.0.0.1:9080/TCP   ClusterIP   test/backend    http       2.1.0.1:9080/TCP   Done
+
+-- frontends-all.table --
+Address            Type        ServiceName     PortName   Backends                             Status
+1.0.0.1:80/TCP     ClusterIP   test/frontend   http       1.1.0.1:8080/TCP                     Done
+2.0.0.1:9080/TCP   ClusterIP   test/backend    http       2.1.0.1:9080/TCP, 2.1.0.2:9080/TCP   Done
+
+-- cec.table --
+Name           Selected   BackendServices   Listeners
+test/ingress   true       test/backend      test/ingress/listener:1000
+
+-- cec.yaml --
+apiVersion: cilium.io/v2
+kind: CiliumEnvoyConfig
+metadata:
+  name: ingress
+  namespace: test
+spec:
+  services:
+    - name: frontend
+      namespace: test
+      listener: ""
+      ports:
+      - 80
+  backendServices:
+    - name: backend
+      namespace: test
+      number:
+      - "9080"
+  resources:
+    - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+      name: listener
+
+-- service.yaml --
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: test
+  uid: a49fe99c-3564-4754-acc4-780f2331a49b
+spec:
+  clusterIP: 1.0.0.1
+  clusterIPs:
+  - 1.0.0.1
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    name: frontend
+  type: ClusterIP
+
+-- endpointslice.yaml --
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  labels:
+    kubernetes.io/service-name: frontend
+  name: frontend-eps1
+  namespace: test
+  uid: d1f517f6-ab88-4c76-9bd0-4906a17cdd75
+addressType: IPv4
+endpoints:
+- addresses:
+  - 1.1.0.1
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  nodeName: nodeport-worker
+ports:
+- name: http
+  port: 8080
+  protocol: TCP
+
+-- be_service.yaml --
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: test
+  uid: b49fe99c-3564-4754-acc4-780f2331a49b
+  annotations:
+    service.kubernetes.io/topology-mode: Auto
+spec:
+  clusterIP: 2.0.0.1
+  clusterIPs:
+  - 2.0.0.1
+  ports:
+  - name: http
+    port: 9080
+    protocol: TCP
+    targetPort: 9080
+  selector:
+    name: backend
+  type: ClusterIP
+  #trafficDistribution: PreferSameZone
+
+-- be_endpointslice.yaml --
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  labels:
+    kubernetes.io/service-name: backend
+  name: backend-eps1
+  namespace: test
+  uid: e1f517f6-ab88-4c76-9bd0-4906a17cdd75
+addressType: IPv4
+endpoints:
+- addresses:
+  - 2.1.0.1
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  nodeName: nodeport-worker
+  zone: zone-a
+  hints:
+    forZones:
+    - name: zone-a
+- addresses:
+  - 2.1.0.2
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  nodeName: nodeport-worker2
+  zone: zone-b
+  hints:
+    forZones:
+    - name: zone-b
+ports:
+- name: http
+  port: 9080
+  protocol: TCP
+
+-- envoy-filtered.expected --
+policy-trigger-count:
+  1
+endpoints:test/backend:9080:
+  cluster_name: "test/backend:9080"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "2.1.0.1"
+            port_value: 9080
+          }
+        }
+      }
+    }
+  }
+  
+endpoints:test/frontend:80:
+  cluster_name: "test/frontend:80"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "1.1.0.1"
+            port_value: 8080
+          }
+        }
+      }
+    }
+  }
+  
+listener:test/ingress/listener:
+  name: "test/ingress/listener"
+  address: {
+    socket_address: {
+      address: "127.0.0.1"
+      port_value: 1000
+    }
+  }
+  additional_addresses: {
+    address: {
+      socket_address: {
+        address: "::1"
+        port_value: 1000
+      }
+    }
+  }
+  listener_filters: {
+    name: "cilium.bpf_metadata"
+    typed_config: {
+      [type.googleapis.com/cilium.BpfMetadata]: {
+        bpf_root: "/sys/fs/bpf"
+        use_original_source_address: true
+        is_l7lb: true
+        proxy_id: 1000
+        ipcache_name: "cilium_ipcache_v2"
+      }
+    }
+  }
+  
+-- envoy-all.expected --
+policy-trigger-count:
+  1
+endpoints:test/backend:9080:
+  cluster_name: "test/backend:9080"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "2.1.0.1"
+            port_value: 9080
+          }
+        }
+      }
+    }
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "2.1.0.2"
+            port_value: 9080
+          }
+        }
+      }
+    }
+  }
+  
+endpoints:test/frontend:80:
+  cluster_name: "test/frontend:80"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "1.1.0.1"
+            port_value: 8080
+          }
+        }
+      }
+    }
+  }
+  
+listener:test/ingress/listener:
+  name: "test/ingress/listener"
+  address: {
+    socket_address: {
+      address: "127.0.0.1"
+      port_value: 1000
+    }
+  }
+  additional_addresses: {
+    address: {
+      socket_address: {
+        address: "::1"
+        port_value: 1000
+      }
+    }
+  }
+  listener_filters: {
+    name: "cilium.bpf_metadata"
+    typed_config: {
+      [type.googleapis.com/cilium.BpfMetadata]: {
+        bpf_root: "/sys/fs/bpf"
+        use_original_source_address: true
+        is_l7lb: true
+        proxy_id: 1000
+        ipcache_name: "cilium_ipcache_v2"
+      }
+    }
+  }
+  
+-- envoy-filtered-td.expected --
+policy-trigger-count:
+  1
+endpoints:test/backend:9080:
+  cluster_name: "test/backend:9080"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "2.1.0.1"
+            port_value: 9080
+          }
+        }
+      }
+    }
+  }
+  
+endpoints:test/frontend:80:
+  cluster_name: "test/frontend:80"
+  endpoints: {
+    lb_endpoints: {
+      endpoint: {
+        address: {
+          socket_address: {
+            address: "1.1.0.1"
+            port_value: 8080
+          }
+        }
+      }
+    }
+  }
+  
+listener:test/ingress/listener:
+  name: "test/ingress/listener"
+  address: {
+    socket_address: {
+      address: "127.0.0.1"
+      port_value: 1000
+    }
+  }
+  additional_addresses: {
+    address: {
+      socket_address: {
+        address: "::1"
+        port_value: 1000
+      }
+    }
+  }
+  listener_filters: {
+    name: "cilium.bpf_metadata"
+    typed_config: {
+      [type.googleapis.com/cilium.BpfMetadata]: {
+        bpf_root: "/sys/fs/bpf"
+        use_original_source_address: true
+        is_l7lb: true
+        proxy_id: 1000
+        ipcache_name: "cilium_ipcache_v2"
+      }
+    }
+  }
+  
