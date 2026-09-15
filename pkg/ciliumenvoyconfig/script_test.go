@@ -81,6 +81,7 @@ func TestScript(t *testing.T) {
 			metrics.Cell,
 			maglev.Cell,
 			cell.Config(CECConfig{}),
+			cell.Config(loadbalancer.TestConfig{}),
 			cell.Config(envoyCfg.SecretSyncConfig{}),
 			cell.Config(envoyCfg.ProxyConfig{}),
 
@@ -107,9 +108,7 @@ func TestScript(t *testing.T) {
 						KubeProxyReplacement: true,
 					}
 				},
-				func() *loadbalancer.TestConfig {
-					return &loadbalancer.TestConfig{}
-				},
+				func(cfg loadbalancer.TestConfig) *loadbalancer.TestConfig { return &cfg },
 			),
 
 			// cecResourceParser and its friends.
@@ -155,6 +154,7 @@ func TestScript(t *testing.T) {
 
 		flags := pflag.NewFlagSet("", pflag.ContinueOnError)
 		h.RegisterFlags(flags)
+		require.NoError(t, flags.Parse(args), "parsing hive arguments")
 
 		var opts []hivetest.LogOption
 		if *debug {
